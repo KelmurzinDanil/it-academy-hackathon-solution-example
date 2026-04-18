@@ -1,10 +1,12 @@
 import logging
 import os
+import re
 from contextlib import asynccontextmanager
 from functools import lru_cache
 from typing import Any
 
 import httpx
+import pymorphy3
 from fastembed import SparseTextEmbedding
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
@@ -33,6 +35,16 @@ REQUIRED_ENV_VARS = [
     "RERANKER_URL",
     "QDRANT_URL",
 ]
+
+# Qwen3-Embedding официально рекомендует оборачивать QUERY (не документы) в
+# формат "Instruct: {task}\nQuery: {q}". Это асимметрия by design — модель
+# обучена её ожидать, и на retrieval-бенчмарках даёт +1–3% к recall.
+# Если в какой-то момент захочешь отключить — выстави DENSE_QUERY_INSTRUCT=0.
+DENSE_QUERY_INSTRUCT_ENABLED = os.getenv("DENSE_QUERY_INSTRUCT", "1") not in ("0", "false", "False", "")
+DENSE_INSTRUCT_TASK = os.getenv(
+    "DENSE_INSTRUCT_TASK",
+    "Given a user question, retrieve relevant chat messages that answer the question.",
+)
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 logger = logging.getLogger("search-service")
@@ -71,6 +83,10 @@ def get_upstream_request_kwargs() -> dict[str, Any]:
 
     return kwargs
 
+
+# =============================================================================
+# Schemas
+# =============================================================================
 
 class DateRange(BaseModel):
     from_: str = Field(alias="from")
@@ -139,6 +155,60 @@ class ChunkMetadata(BaseModel):
     contains_quote: bool = False
 
 
+# =============================================================================
+# Лемматизация — должна 1-в-1 совпадать с index/main.py
+# =============================================================================
+
+_WORD_RE = re.compile(r"[А-Яа-яЁёA-Za-z0-9]+", re.UNICODE)
+_LATIN_ONLY = re.compile(r"^[A-Za-z]+$")
+
+
+@lru_cache(maxsize=1)
+def get_morph() -> pymorphy3.MorphAnalyzer:
+    logger.info("Loading pymorphy3 MorphAnalyzer (ru)")
+    return pymorphy3.MorphAnalyzer(lang="ru")
+
+
+@lru_cache(maxsize=200_000)
+def _lemma_ru(word: str) -> str:
+    try:
+        return get_morph().parse(word)[0].normal_form
+    except Exception:
+        return word
+
+
+def lemmatize_text(text: str) -> str:
+    """Лемматизация: кириллица → normal_form, латиница/цифры → lower без изменений.
+
+    КРИТИЧНО: совпадает с index-service. Иначе BM25 не найдёт ничего
+    (индекс хранит леммы, а запрос был бы в словоформе).
+    """
+    if not text:
+        return ""
+    tokens: list[str] = []
+    for match in _WORD_RE.finditer(text):
+        token = match.group(0).lower()
+        if token.isdigit():
+            tokens.append(token)
+        elif _LATIN_ONLY.match(token):
+            tokens.append(token)
+        else:
+            tokens.append(_lemma_ru(token))
+    return " ".join(tokens)
+
+
+def _email_to_pretty(email: str) -> str:
+    """ivan.petrov@vk.com -> 'ivan petrov' — чтобы матчить sender'ов из индекса."""
+    if not email:
+        return ""
+    local = email.split("@", 1)[0]
+    return local.replace(".", " ").replace("_", " ").strip().lower()
+
+
+# =============================================================================
+# Sparse model (локально, для запросов)
+# =============================================================================
+
 @lru_cache(maxsize=1)
 def get_sparse_model() -> SparseTextEmbedding:
     logger.info("Loading local sparse model %s", SPARSE_MODEL_NAME)
@@ -152,7 +222,10 @@ async def lifespan(app: FastAPI):
         url=QDRANT_URL,
         api_key=API_KEY,
     )
+    # warm-up: грузим BM25 и pymorphy3 ДО первого запроса,
+    # чтобы не словить cold-start timeout.
     get_sparse_model()
+    get_morph()
     try:
         yield
     finally:
@@ -160,8 +233,12 @@ async def lifespan(app: FastAPI):
         await app.state.qdrant.close()
 
 
-app = FastAPI(title="Search Service", version="0.2.0", lifespan=lifespan)
+app = FastAPI(title="Search Service", version="0.3.0", lifespan=lifespan)
 
+
+# =============================================================================
+# Конфиг retrieval'а
+# =============================================================================
 
 MAX_VARIANTS = 2
 MAX_HYDE = 1
@@ -172,6 +249,108 @@ RETRIEVE_K = 60
 RERANK_N = 20
 MAX_RESULT_IDS = 50
 
+
+# =============================================================================
+# Построение запросов
+# =============================================================================
+
+def wrap_dense_query(text: str) -> str:
+    """Qwen3-Embedding query instruction format.
+
+    Документы (которые индексирует тестирующая система) НЕ оборачиваются —
+    это асимметричный retrieval, model trained это ожидать.
+    """
+    if not DENSE_QUERY_INSTRUCT_ENABLED or not text:
+        return text
+    return f"Instruct: {DENSE_INSTRUCT_TASK}\nQuery: {text}"
+
+
+def build_dense_queries(question: Question) -> tuple[str, list[str]]:
+    """Возвращает (primary_raw, dense_queries_ready_for_embed).
+
+    primary_raw — сырой текст основного запроса, нужен для reranker'а.
+    dense_queries — список, где primary+variants обёрнуты в Instruct,
+    а hyde оставлены как есть (они эмулируют документный стиль).
+    """
+    primary_raw = (question.search_text.strip() or question.text.strip())
+
+    wrapped: list[str] = []
+    seen: set[str] = set()
+
+    def _add(q: str, wrap: bool) -> None:
+        q = q.strip() if q else ""
+        if not q:
+            return
+        key = q.lower()
+        if key in seen:
+            return
+        seen.add(key)
+        wrapped.append(wrap_dense_query(q) if wrap else q)
+
+    _add(primary_raw, wrap=True)
+
+    for v in (question.variants or [])[:MAX_VARIANTS]:
+        if isinstance(v, str):
+            _add(v, wrap=True)
+
+    for h in (question.hyde or [])[:MAX_HYDE]:
+        if isinstance(h, str):
+            _add(h, wrap=False)  # hyde = гипотетический документ, без Instruct
+
+    # Отсечём лишнее, чтобы не бить в rate-limit dense API
+    return primary_raw, wrapped[:MAX_QUERIES]
+
+
+def build_sparse_query_text(question: Question) -> str:
+    """Собирает богатый keyword-запрос для BM25 и лемматизирует.
+
+    Источники: primary text + variants + keywords + entities.
+    Entities.emails дополнительно раскрываем в pretty-form ('ivan petrov'),
+    т.к. индекс рендерит sender'ов именно так.
+    """
+    parts: list[str] = []
+
+    primary = (question.search_text.strip() or question.text.strip())
+    if primary:
+        parts.append(primary)
+
+    for v in (question.variants or [])[:MAX_VARIANTS]:
+        if isinstance(v, str) and v.strip():
+            parts.append(v.strip())
+
+    for kw in (question.keywords or []):
+        if isinstance(kw, str) and kw.strip():
+            parts.append(kw.strip())
+
+    if question.entities:
+        for field in ("people", "documents", "names", "links"):
+            vals = getattr(question.entities, field, None) or []
+            for v in vals:
+                if isinstance(v, str) and v.strip():
+                    parts.append(v.strip())
+        # emails: и сам email, и pretty-форма
+        for em in (question.entities.emails or []):
+            if not isinstance(em, str) or not em.strip():
+                continue
+            parts.append(em.strip())
+            pretty = _email_to_pretty(em)
+            if pretty:
+                parts.append(pretty)
+
+    # asker иногда важен: если в индексе есть фразы типа "Ivan Petrov пишет..."
+    if question.asker:
+        asker_pretty = _email_to_pretty(question.asker)
+        if asker_pretty:
+            parts.append(asker_pretty)
+
+    combined = " ".join(parts)
+    lemmatized = lemmatize_text(combined)
+    return lemmatized if lemmatized else combined.lower()
+
+
+# =============================================================================
+# Embeddings
+# =============================================================================
 
 async def embed_dense_many(client: httpx.AsyncClient, texts: list[str]) -> list[list[float]]:
     if not texts:
@@ -193,7 +372,12 @@ async def embed_dense_many(client: httpx.AsyncClient, texts: list[str]) -> list[
 
 
 async def embed_sparse(text: str) -> SparseVector:
-    vectors = list(get_sparse_model().embed([text]))
+    """Лемматизирует текст и прогоняет через локальный BM25."""
+    prepared = lemmatize_text(text)
+    if not prepared.strip():
+        prepared = (text or "").strip().lower() or "пусто"
+
+    vectors = list(get_sparse_model().embed([prepared]))
     if not vectors:
         raise ValueError("Sparse embedding response is empty")
     item = vectors[0]
@@ -203,38 +387,9 @@ async def embed_sparse(text: str) -> SparseVector:
     )
 
 
-def build_queries(question: Question) -> list[str]:
-    """Собирает список запросов для multi-query retrieval.
-
-    Порядок: search_text/text → variants (≤2) → hyde (≤1). Дедуп, пустые отсекаем.
-    Лимит MAX_QUERIES нужен чтобы не упереться в rate limit dense API.
-    """
-    primary = (question.search_text.strip() or question.text.strip())
-    candidates: list[str] = []
-    if primary:
-        candidates.append(primary)
-
-    for variant in (question.variants or [])[:MAX_VARIANTS]:
-        if isinstance(variant, str) and variant.strip():
-            candidates.append(variant.strip())
-
-    for hyde in (question.hyde or [])[:MAX_HYDE]:
-        if isinstance(hyde, str) and hyde.strip():
-            candidates.append(hyde.strip())
-
-    seen: set[str] = set()
-    queries: list[str] = []
-    for q in candidates:
-        key = q.lower()
-        if key in seen:
-            continue
-        seen.add(key)
-        queries.append(q)
-        if len(queries) >= MAX_QUERIES:
-            break
-
-    return queries
-
+# =============================================================================
+# Qdrant retrieval
+# =============================================================================
 
 async def qdrant_search(
     client: AsyncQdrantClient,
@@ -278,6 +433,10 @@ def extract_message_ids(point: Any) -> list[str]:
     message_ids = metadata.get("message_ids") or payload.get("message_ids") or []
     return [str(message_id) for message_id in message_ids]
 
+
+# =============================================================================
+# Reranker
+# =============================================================================
 
 async def get_rerank_scores(
     client: httpx.AsyncClient,
@@ -355,6 +514,10 @@ def flatten_message_ids(points: list[Any], limit: int) -> list[str]:
     return result
 
 
+# =============================================================================
+# Endpoints
+# =============================================================================
+
 @app.get("/health")
 async def health() -> dict[str, str]:
     return {"status": "ok"}
@@ -363,28 +526,36 @@ async def health() -> dict[str, str]:
 @app.post("/search", response_model=SearchAPIResponse)
 async def search(payload: SearchAPIRequest) -> SearchAPIResponse:
     question = payload.question
-    queries = build_queries(question)
-    if not queries:
+
+    primary_raw, dense_queries = build_dense_queries(question)
+    if not primary_raw:
         raise HTTPException(status_code=400, detail="question.text is required")
+
+    sparse_query_text = build_sparse_query_text(question)
 
     client: httpx.AsyncClient = app.state.http
     qdrant: AsyncQdrantClient = app.state.qdrant
 
-    primary = queries[0]
-
+    # Dense: пробуем multi-query, при сбое (rate limit, timeout) — только primary
     try:
-        dense_vectors = await embed_dense_many(client, queries)
+        dense_vectors = await embed_dense_many(client, dense_queries)
     except Exception as exc:
-        logger.warning("Multi-query dense failed (%s), retrying with primary only", exc)
-        dense_vectors = await embed_dense_many(client, [primary])
+        logger.warning(
+            "Multi-query dense failed (%s), retrying with primary only", exc
+        )
+        dense_vectors = await embed_dense_many(client, [dense_queries[0]])
 
-    sparse_vector = await embed_sparse(primary)
+    # Sparse: обогащённый лемматизированный запрос (keywords + entities + text)
+    sparse_vector = await embed_sparse(sparse_query_text)
+
     points = await qdrant_search(qdrant, dense_vectors, sparse_vector)
 
     if not points:
         return SearchAPIResponse(results=[SearchAPIItem(message_ids=[])])
 
-    points = await rerank_points(client, primary, points)
+    # Rerank: передаём reranker'у СЫРОЙ вопрос (без Instruct-обёртки) —
+    # nvidia/llama-nemotron-rerank-1b-v2 ожидает естественный текст.
+    points = await rerank_points(client, primary_raw, points)
     message_ids = flatten_message_ids(points, MAX_RESULT_IDS)
 
     return SearchAPIResponse(results=[SearchAPIItem(message_ids=message_ids)])
