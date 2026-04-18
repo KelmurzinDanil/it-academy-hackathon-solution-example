@@ -25,7 +25,7 @@ login:
 
 build:
 	@: $(if $(TEAM_ID),,$(error TEAM_ID is required for make build))
-	docker build -t $(IMAGE) ./
+	docker build --platform linux/amd64 -t $(IMAGE) ./
 
 run: build
 	@: $(foreach var,$(REQUIRED_RUN_VARS),$(if $($(var)),,$(error $(var) is required for make run)))

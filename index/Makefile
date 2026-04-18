@@ -15,7 +15,7 @@ login:
 
 build:
 	@: $(if $(TEAM_ID),,$(error TEAM_ID is required for make build))
-	docker build -t $(IMAGE) ./
+	docker build --platform linux/amd64 -t $(IMAGE) ./
 
 run: build
 	docker run --rm -p $(PORT):8000 $(IMAGE)
