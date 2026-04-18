@@ -1,5 +1,7 @@
+import asyncio
 import logging
 import os
+import random
 import re
 from contextlib import asynccontextmanager
 from functools import lru_cache
@@ -36,15 +38,30 @@ REQUIRED_ENV_VARS = [
     "QDRANT_URL",
 ]
 
-# Qwen3-Embedding официально рекомендует оборачивать QUERY (не документы) в
-# формат "Instruct: {task}\nQuery: {q}". Это асимметрия by design — модель
-# обучена её ожидать, и на retrieval-бенчмарках даёт +1–3% к recall.
-# Если в какой-то момент захочешь отключить — выстави DENSE_QUERY_INSTRUCT=0.
+# --- Qwen3 Instruct (асимметричная обёртка query, см. предыдущую итерацию) ---
 DENSE_QUERY_INSTRUCT_ENABLED = os.getenv("DENSE_QUERY_INSTRUCT", "1") not in ("0", "false", "False", "")
 DENSE_INSTRUCT_TASK = os.getenv(
     "DENSE_INSTRUCT_TASK",
     "Given a user question, retrieve relevant chat messages that answer the question.",
 )
+
+# --- Retrieval (всё через env — удобно крутить без пересборки) ---
+MAX_VARIANTS = int(os.getenv("MAX_VARIANTS", "2"))
+MAX_HYDE = int(os.getenv("MAX_HYDE", "1"))
+MAX_QUERIES = int(os.getenv("MAX_QUERIES", "4"))
+DENSE_PREFETCH_K = int(os.getenv("DENSE_PREFETCH_K", "40"))
+SPARSE_PREFETCH_K = int(os.getenv("SPARSE_PREFETCH_K", "60"))
+RETRIEVE_K = int(os.getenv("RETRIEVE_K", "60"))
+RERANK_N = int(os.getenv("RERANK_N", "20"))
+MAX_RESULT_IDS = int(os.getenv("MAX_RESULT_IDS", "50"))
+
+# --- Троттлинг upstream (dense + rerank): главный рычаг против 429 ---
+UPSTREAM_CONCURRENCY = int(os.getenv("UPSTREAM_CONCURRENCY", "2"))
+UPSTREAM_MAX_RETRIES = int(os.getenv("UPSTREAM_MAX_RETRIES", "4"))
+UPSTREAM_INITIAL_BACKOFF = float(os.getenv("UPSTREAM_INITIAL_BACKOFF", "0.6"))
+UPSTREAM_MAX_BACKOFF = float(os.getenv("UPSTREAM_MAX_BACKOFF", "10.0"))
+UPSTREAM_JITTER = float(os.getenv("UPSTREAM_JITTER", "0.3"))
+UPSTREAM_HTTP_TIMEOUT = float(os.getenv("UPSTREAM_HTTP_TIMEOUT", "45.0"))
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 logger = logging.getLogger("search-service")
@@ -156,7 +173,7 @@ class ChunkMetadata(BaseModel):
 
 
 # =============================================================================
-# Лемматизация — должна 1-в-1 совпадать с index/main.py
+# Лемматизация (1-в-1 с index-сервисом — иначе BM25 не найдёт ничего)
 # =============================================================================
 
 _WORD_RE = re.compile(r"[А-Яа-яЁёA-Za-z0-9]+", re.UNICODE)
@@ -178,11 +195,6 @@ def _lemma_ru(word: str) -> str:
 
 
 def lemmatize_text(text: str) -> str:
-    """Лемматизация: кириллица → normal_form, латиница/цифры → lower без изменений.
-
-    КРИТИЧНО: совпадает с index-service. Иначе BM25 не найдёт ничего
-    (индекс хранит леммы, а запрос был бы в словоформе).
-    """
     if not text:
         return ""
     tokens: list[str] = []
@@ -198,7 +210,6 @@ def lemmatize_text(text: str) -> str:
 
 
 def _email_to_pretty(email: str) -> str:
-    """ivan.petrov@vk.com -> 'ivan petrov' — чтобы матчить sender'ов из индекса."""
     if not email:
         return ""
     local = email.split("@", 1)[0]
@@ -206,7 +217,7 @@ def _email_to_pretty(email: str) -> str:
 
 
 # =============================================================================
-# Sparse model (локально, для запросов)
+# Sparse model и lifespan
 # =============================================================================
 
 @lru_cache(maxsize=1)
@@ -217,13 +228,11 @@ def get_sparse_model() -> SparseTextEmbedding:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    app.state.http = httpx.AsyncClient(timeout=httpx.Timeout(30.0))
-    app.state.qdrant = AsyncQdrantClient(
-        url=QDRANT_URL,
-        api_key=API_KEY,
-    )
-    # warm-up: грузим BM25 и pymorphy3 ДО первого запроса,
-    # чтобы не словить cold-start timeout.
+    app.state.http = httpx.AsyncClient(timeout=httpx.Timeout(UPSTREAM_HTTP_TIMEOUT))
+    app.state.qdrant = AsyncQdrantClient(url=QDRANT_URL, api_key=API_KEY)
+    # Semaphore нужно создавать в running loop → здесь, в lifespan.
+    app.state.upstream_sem = asyncio.Semaphore(UPSTREAM_CONCURRENCY)
+    # warm-up, чтобы cold-start не съел SLA первого запроса
     get_sparse_model()
     get_morph()
     try:
@@ -233,21 +242,107 @@ async def lifespan(app: FastAPI):
         await app.state.qdrant.close()
 
 
-app = FastAPI(title="Search Service", version="0.3.0", lifespan=lifespan)
+app = FastAPI(title="Search Service", version="0.4.0", lifespan=lifespan)
 
 
 # =============================================================================
-# Конфиг retrieval'а
+# Upstream: retry + backoff + jitter + Retry-After + semaphore
 # =============================================================================
 
-MAX_VARIANTS = 2
-MAX_HYDE = 1
-MAX_QUERIES = 4
-DENSE_PREFETCH_K = 40
-SPARSE_PREFETCH_K = 60
-RETRIEVE_K = 60
-RERANK_N = 20
-MAX_RESULT_IDS = 50
+_RETRYABLE_STATUSES = {408, 409, 425, 429, 500, 502, 503, 504}
+
+
+def _parse_retry_after(value: str | None) -> float | None:
+    """Retry-After может быть и числом, и HTTP-датой — берём только число."""
+    if not value:
+        return None
+    try:
+        return max(0.0, float(value))
+    except (TypeError, ValueError):
+        return None
+
+
+async def upstream_post(
+    client: httpx.AsyncClient,
+    url: str,
+    sem: asyncio.Semaphore,
+    json_payload: dict[str, Any],
+    op_label: str,
+) -> httpx.Response:
+    """POST к upstream с адаптивным retry.
+
+    * Семафор — конкурентность внутри воркера: сглаживает burst при параллельной оценке.
+    * На 429 уважаем Retry-After, если пришёл.
+    * Exponential backoff с jitter: разносим retry-волны разных запросов.
+    * 5xx тоже ретраим — upstream мог просто перегреться.
+    """
+    backoff = UPSTREAM_INITIAL_BACKOFF
+    last_exc: Exception | None = None
+
+    for attempt in range(UPSTREAM_MAX_RETRIES + 1):
+        response: httpx.Response | None = None
+        status: int | None = None
+        retry_after_sec: float | None = None
+
+        try:
+            async with sem:
+                response = await client.post(
+                    url,
+                    **get_upstream_request_kwargs(),
+                    json=json_payload,
+                )
+            status = response.status_code
+        except httpx.TimeoutException as exc:
+            last_exc = exc
+            logger.warning(
+                "%s: timeout on attempt %d/%d",
+                op_label, attempt + 1, UPSTREAM_MAX_RETRIES + 1,
+            )
+        except httpx.HTTPError as exc:
+            last_exc = exc
+            logger.warning(
+                "%s: httpx error on attempt %d: %s", op_label, attempt + 1, exc
+            )
+
+        # Успех
+        if response is not None and status == 200:
+            return response
+
+        # Не-retryable статус — сразу выбрасываем
+        if response is not None and status not in _RETRYABLE_STATUSES:
+            response.raise_for_status()
+            return response  # unreachable
+
+        if response is not None:
+            retry_after_sec = _parse_retry_after(response.headers.get("Retry-After"))
+            last_exc = httpx.HTTPStatusError(
+                f"{op_label}: {status}",
+                request=response.request,
+                response=response,
+            )
+
+        # Попытки кончились → вверх
+        if attempt >= UPSTREAM_MAX_RETRIES:
+            logger.warning("%s: retries exhausted (status=%s)", op_label, status)
+            if last_exc:
+                raise last_exc
+            raise RuntimeError(f"{op_label}: retries exhausted")
+
+        # Считаем паузу
+        wait = backoff
+        if retry_after_sec is not None:
+            wait = max(wait, retry_after_sec)
+        wait = min(wait, UPSTREAM_MAX_BACKOFF)
+        jittered = wait + random.uniform(0.0, wait * UPSTREAM_JITTER)
+
+        logger.warning(
+            "%s: attempt %d failed (status=%s), backing off %.2fs",
+            op_label, attempt + 1, status, jittered,
+        )
+        await asyncio.sleep(jittered)
+        backoff = min(backoff * 2, UPSTREAM_MAX_BACKOFF)
+
+    raise RuntimeError(f"{op_label}: unexpected retry exit")
 
 
 # =============================================================================
@@ -255,23 +350,13 @@ MAX_RESULT_IDS = 50
 # =============================================================================
 
 def wrap_dense_query(text: str) -> str:
-    """Qwen3-Embedding query instruction format.
-
-    Документы (которые индексирует тестирующая система) НЕ оборачиваются —
-    это асимметричный retrieval, model trained это ожидать.
-    """
     if not DENSE_QUERY_INSTRUCT_ENABLED or not text:
         return text
     return f"Instruct: {DENSE_INSTRUCT_TASK}\nQuery: {text}"
 
 
 def build_dense_queries(question: Question) -> tuple[str, list[str]]:
-    """Возвращает (primary_raw, dense_queries_ready_for_embed).
-
-    primary_raw — сырой текст основного запроса, нужен для reranker'а.
-    dense_queries — список, где primary+variants обёрнуты в Instruct,
-    а hyde оставлены как есть (они эмулируют документный стиль).
-    """
+    """→ (primary_raw для rerank, список dense-текстов для embed)."""
     primary_raw = (question.search_text.strip() or question.text.strip())
 
     wrapped: list[str] = []
@@ -288,26 +373,18 @@ def build_dense_queries(question: Question) -> tuple[str, list[str]]:
         wrapped.append(wrap_dense_query(q) if wrap else q)
 
     _add(primary_raw, wrap=True)
-
     for v in (question.variants or [])[:MAX_VARIANTS]:
         if isinstance(v, str):
             _add(v, wrap=True)
-
     for h in (question.hyde or [])[:MAX_HYDE]:
         if isinstance(h, str):
-            _add(h, wrap=False)  # hyde = гипотетический документ, без Instruct
+            _add(h, wrap=False)  # hyde — документный стиль, без Instruct
 
-    # Отсечём лишнее, чтобы не бить в rate-limit dense API
     return primary_raw, wrapped[:MAX_QUERIES]
 
 
 def build_sparse_query_text(question: Question) -> str:
-    """Собирает богатый keyword-запрос для BM25 и лемматизирует.
-
-    Источники: primary text + variants + keywords + entities.
-    Entities.emails дополнительно раскрываем в pretty-form ('ivan petrov'),
-    т.к. индекс рендерит sender'ов именно так.
-    """
+    """Лемматизированный keyword-rich текст: text + variants + keywords + entities."""
     parts: list[str] = []
 
     primary = (question.search_text.strip() or question.text.strip())
@@ -328,7 +405,6 @@ def build_sparse_query_text(question: Question) -> str:
             for v in vals:
                 if isinstance(v, str) and v.strip():
                     parts.append(v.strip())
-        # emails: и сам email, и pretty-форма
         for em in (question.entities.emails or []):
             if not isinstance(em, str) or not em.strip():
                 continue
@@ -337,7 +413,6 @@ def build_sparse_query_text(question: Question) -> str:
             if pretty:
                 parts.append(pretty)
 
-    # asker иногда важен: если в индексе есть фразы типа "Ivan Petrov пишет..."
     if question.asker:
         asker_pretty = _email_to_pretty(question.asker)
         if asker_pretty:
@@ -352,18 +427,23 @@ def build_sparse_query_text(question: Question) -> str:
 # Embeddings
 # =============================================================================
 
-async def embed_dense_many(client: httpx.AsyncClient, texts: list[str]) -> list[list[float]]:
+async def embed_dense_many(
+    client: httpx.AsyncClient,
+    sem: asyncio.Semaphore,
+    texts: list[str],
+) -> list[list[float]]:
     if not texts:
         return []
-    response = await client.post(
+    response = await upstream_post(
+        client,
         EMBEDDINGS_DENSE_URL,
-        **get_upstream_request_kwargs(),
-        json={
+        sem=sem,
+        json_payload={
             "model": os.getenv("EMBEDDINGS_DENSE_MODEL", EMBEDDINGS_DENSE_MODEL),
             "input": texts,
         },
+        op_label="dense",
     )
-    response.raise_for_status()
     payload = DenseEmbeddingResponse.model_validate(response.json())
     if not payload.data:
         raise ValueError("Dense embedding response is empty")
@@ -372,7 +452,6 @@ async def embed_dense_many(client: httpx.AsyncClient, texts: list[str]) -> list[
 
 
 async def embed_sparse(text: str) -> SparseVector:
-    """Лемматизирует текст и прогоняет через локальный BM25."""
     prepared = lemmatize_text(text)
     if not prepared.strip():
         prepared = (text or "").strip().lower() or "пусто"
@@ -388,7 +467,7 @@ async def embed_sparse(text: str) -> SparseVector:
 
 
 # =============================================================================
-# Qdrant retrieval
+# Qdrant
 # =============================================================================
 
 async def qdrant_search(
@@ -435,29 +514,30 @@ def extract_message_ids(point: Any) -> list[str]:
 
 
 # =============================================================================
-# Reranker
+# Rerank
 # =============================================================================
 
 async def get_rerank_scores(
     client: httpx.AsyncClient,
+    sem: asyncio.Semaphore,
     label: str,
     targets: list[str],
 ) -> list[float]:
     if not targets:
         return []
 
-    response = await client.post(
+    response = await upstream_post(
+        client,
         RERANKER_URL,
-        **get_upstream_request_kwargs(),
-        json={
+        sem=sem,
+        json_payload={
             "model": RERANKER_MODEL,
             "encoding_format": "float",
             "text_1": label,
             "text_2": targets,
         },
+        op_label="rerank",
     )
-    response.raise_for_status()
-
     payload = response.json()
     data = payload.get("data") or []
     return [float(sample["score"]) for sample in data]
@@ -465,6 +545,7 @@ async def get_rerank_scores(
 
 async def rerank_points(
     client: httpx.AsyncClient,
+    sem: asyncio.Semaphore,
     query: str,
     points: list[Any],
 ) -> list[Any]:
@@ -476,16 +557,15 @@ async def rerank_points(
     targets = [(p.payload or {}).get("page_content") or "" for p in head]
 
     try:
-        scores = await get_rerank_scores(client, query, targets)
+        scores = await get_rerank_scores(client, sem, query, targets)
     except Exception as exc:
-        logger.warning("Rerank failed, falling back to RRF order: %s", exc)
+        logger.warning("Rerank failed after retries, falling back to RRF: %s", exc)
         return points
 
     if len(scores) != len(head):
         logger.warning(
             "Rerank returned %d scores for %d targets, falling back",
-            len(scores),
-            len(head),
+            len(scores), len(head),
         )
         return points
 
@@ -535,17 +615,28 @@ async def search(payload: SearchAPIRequest) -> SearchAPIResponse:
 
     client: httpx.AsyncClient = app.state.http
     qdrant: AsyncQdrantClient = app.state.qdrant
+    sem: asyncio.Semaphore = app.state.upstream_sem
 
-    # Dense: пробуем multi-query, при сбое (rate limit, timeout) — только primary
+    # Dense: 3-уровневый fallback
+    #   1) multi-query (primary + variants + hyde) с retry
+    #   2) primary only с retry
+    #   3) sparse-only retrieval (полностью без dense)
+    # Даже если dense упёрся в лимит — запрос не падает 500-кой, а отдаёт что смог.
+    dense_vectors: list[list[float]] = []
     try:
-        dense_vectors = await embed_dense_many(client, dense_queries)
+        dense_vectors = await embed_dense_many(client, sem, dense_queries)
     except Exception as exc:
-        logger.warning(
-            "Multi-query dense failed (%s), retrying with primary only", exc
-        )
-        dense_vectors = await embed_dense_many(client, [dense_queries[0]])
+        logger.warning("Multi-query dense failed (%s), retrying with primary only", exc)
+        try:
+            dense_vectors = await embed_dense_many(
+                client, sem, [dense_queries[0]] if dense_queries else []
+            )
+        except Exception as exc2:
+            logger.warning(
+                "Primary dense also failed (%s), continuing with sparse-only", exc2
+            )
+            dense_vectors = []
 
-    # Sparse: обогащённый лемматизированный запрос (keywords + entities + text)
     sparse_vector = await embed_sparse(sparse_query_text)
 
     points = await qdrant_search(qdrant, dense_vectors, sparse_vector)
@@ -553,9 +644,7 @@ async def search(payload: SearchAPIRequest) -> SearchAPIResponse:
     if not points:
         return SearchAPIResponse(results=[SearchAPIItem(message_ids=[])])
 
-    # Rerank: передаём reranker'у СЫРОЙ вопрос (без Instruct-обёртки) —
-    # nvidia/llama-nemotron-rerank-1b-v2 ожидает естественный текст.
-    points = await rerank_points(client, primary_raw, points)
+    points = await rerank_points(client, sem, primary_raw, points)
     message_ids = flatten_message_ids(points, MAX_RESULT_IDS)
 
     return SearchAPIResponse(results=[SearchAPIItem(message_ids=message_ids)])
