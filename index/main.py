@@ -78,12 +78,12 @@ class SparseEmbeddingResponse(BaseModel):
 
 app = FastAPI(title="Index Service", version="0.2.0")
 
-CHUNK_CHAR_BUDGET = 1200
-OVERLAP_CHAR_BUDGET = 300
+CHUNK_CHAR_BUDGET = 512
+OVERLAP_CHAR_BUDGET = 256
 MIN_CHUNK_LEN = 20
 SPARSE_MODEL_NAME = "Qdrant/bm25"
 FASTEMBED_CACHE_PATH = "/models/fastembed"
-UVICORN_WORKERS = 4
+UVICORN_WORKERS = 8
 
 
 def _sender_short(sender_id: str) -> str:
@@ -150,8 +150,8 @@ def build_chunks(
     """Группирует сообщения в чанки по бюджету символов с текстовым overlap'ом.
 
     Чанки режутся на границах сообщений, чтобы не ломать контекст. Оверлап
-    реализован как текстовый хвост предыдущего чанка, не как повтор сообщений —
-    так мы не плодим дубликаты message_ids и не теряем границы.
+    реализован как текстовый хвост предыдущего чанка.
+    Добавлена защита: если одно сообщение больше бюджета, оно принудительно бьется на части.
     """
     results: list[IndexAPIItem] = []
 
@@ -175,6 +175,7 @@ def build_chunks(
             return tail
         body = "\n".join(current_texts)
         chunk_text = f"{tail}\n{body}" if tail else body
+        
         if len(chunk_text.strip()) >= MIN_CHUNK_LEN:
             results.append(
                 IndexAPIItem(
@@ -184,6 +185,7 @@ def build_chunks(
                     message_ids=list(current_ids),
                 )
             )
+            
         next_tail = body[-OVERLAP_CHAR_BUDGET:] if body else tail
         current_texts = []
         current_ids = []
@@ -194,14 +196,33 @@ def build_chunks(
         rendered = render_message(message, chat.name)
         if not rendered:
             continue
-        rendered_len = len(rendered) + 1
+            
+        message_parts = []
+        text_to_split = rendered
+        
+        while len(text_to_split) > CHUNK_CHAR_BUDGET:
+            split_idx = text_to_split.rfind(' ', 0, CHUNK_CHAR_BUDGET)
+            if split_idx == -1: 
+                split_idx = CHUNK_CHAR_BUDGET
+                
+            message_parts.append(text_to_split[:split_idx])
+            text_to_split = text_to_split[split_idx:].strip()
+            
+        if text_to_split:
+            message_parts.append(text_to_split)
 
-        if current_len + rendered_len > CHUNK_CHAR_BUDGET and current_texts:
-            overlap_tail = flush(overlap_tail)
+        for part in message_parts:
+            part_len = len(part) + 1 
+            
+            if current_len + part_len > CHUNK_CHAR_BUDGET and current_texts:
+                overlap_tail = flush(overlap_tail)
 
-        current_texts.append(rendered)
-        current_ids.append(message.id)
-        current_len += rendered_len
+            current_texts.append(part)
+            
+            if message.id not in current_ids:
+                current_ids.append(message.id)
+                
+            current_len += part_len
 
     flush(overlap_tail)
 
@@ -223,7 +244,6 @@ async def index(payload: IndexAPIRequest) -> IndexAPIResponse:
         )
     )
 
-
 @lru_cache(maxsize=1)
 def get_sparse_model():
     from fastembed import SparseTextEmbedding
@@ -233,13 +253,16 @@ def get_sparse_model():
         SPARSE_MODEL_NAME,
         FASTEMBED_CACHE_PATH,
     )
-    return SparseTextEmbedding(model_name=SPARSE_MODEL_NAME)
 
+    return SparseTextEmbedding(model_name=SPARSE_MODEL_NAME, cache_dir=FASTEMBED_CACHE_PATH)
 
 def embed_sparse_texts(texts: list[str]) -> list[dict[str, list[int] | list[float]]]:
     model = get_sparse_model()
     vectors: list[dict[str, list[int] | list[float]]] = []
-    for item in model.embed(texts):
+    MAX_SPARSE_LEN = 2000
+    safe_texts = [t[:MAX_SPARSE_LEN] for t in texts]
+
+    for item in model.embed(safe_texts, batch_size=128):
         vectors.append(
             {
                 "indices": item.indices.tolist(),
