@@ -101,10 +101,6 @@ def get_upstream_request_kwargs() -> dict[str, Any]:
     return kwargs
 
 
-# =============================================================================
-# Schemas
-# =============================================================================
-
 class DateRange(BaseModel):
     from_: str = Field(alias="from")
     to: str
@@ -172,10 +168,6 @@ class ChunkMetadata(BaseModel):
     contains_quote: bool = False
 
 
-# =============================================================================
-# Лемматизация (1-в-1 с index-сервисом — иначе BM25 не найдёт ничего)
-# =============================================================================
-
 _WORD_RE = re.compile(r"[А-Яа-яЁёA-Za-z0-9]+", re.UNICODE)
 _LATIN_ONLY = re.compile(r"^[A-Za-z]+$")
 
@@ -216,10 +208,6 @@ def _email_to_pretty(email: str) -> str:
     return local.replace(".", " ").replace("_", " ").strip().lower()
 
 
-# =============================================================================
-# Sparse model и lifespan
-# =============================================================================
-
 @lru_cache(maxsize=1)
 def get_sparse_model() -> SparseTextEmbedding:
     logger.info("Loading local sparse model %s", SPARSE_MODEL_NAME)
@@ -244,10 +232,6 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Search Service", version="0.4.0", lifespan=lifespan)
 
-
-# =============================================================================
-# Upstream: retry + backoff + jitter + Retry-After + semaphore
-# =============================================================================
 
 _RETRYABLE_STATUSES = {408, 409, 425, 429, 500, 502, 503, 504}
 
@@ -345,10 +329,6 @@ async def upstream_post(
     raise RuntimeError(f"{op_label}: unexpected retry exit")
 
 
-# =============================================================================
-# Построение запросов
-# =============================================================================
-
 def wrap_dense_query(text: str) -> str:
     if not DENSE_QUERY_INSTRUCT_ENABLED or not text:
         return text
@@ -423,10 +403,6 @@ def build_sparse_query_text(question: Question) -> str:
     return lemmatized if lemmatized else combined.lower()
 
 
-# =============================================================================
-# Embeddings
-# =============================================================================
-
 async def embed_dense_many(
     client: httpx.AsyncClient,
     sem: asyncio.Semaphore,
@@ -465,10 +441,6 @@ async def embed_sparse(text: str) -> SparseVector:
         values=[float(value) for value in item.values.tolist()],
     )
 
-
-# =============================================================================
-# Qdrant
-# =============================================================================
 
 async def qdrant_search(
     client: AsyncQdrantClient,
@@ -512,10 +484,6 @@ def extract_message_ids(point: Any) -> list[str]:
     message_ids = metadata.get("message_ids") or payload.get("message_ids") or []
     return [str(message_id) for message_id in message_ids]
 
-
-# =============================================================================
-# Rerank
-# =============================================================================
 
 async def get_rerank_scores(
     client: httpx.AsyncClient,
@@ -593,10 +561,6 @@ def flatten_message_ids(points: list[Any], limit: int) -> list[str]:
                 return result
     return result
 
-
-# =============================================================================
-# Endpoints
-# =============================================================================
 
 @app.get("/health")
 async def health() -> dict[str, str]:

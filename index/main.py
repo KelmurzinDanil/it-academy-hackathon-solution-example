@@ -12,20 +12,11 @@ from pydantic import BaseModel
 
 import pymorphy3
 
-# =============================================================================
-# Настройки окружения и логирования
-# =============================================================================
-
 HOST = os.getenv("HOST", "0.0.0.0")
 PORT = int(os.getenv("PORT", "8000"))
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 logger = logging.getLogger("index-service")
-
-
-# =============================================================================
-# Pydantic-схемы (строго по ТЗ, не трогаем контракты)
-# =============================================================================
 
 class Chat(BaseModel):
     id: str
@@ -90,38 +81,21 @@ class SparseEmbeddingResponse(BaseModel):
 app = FastAPI(title="Index Service", version="0.3.0")
 
 
-# =============================================================================
-# Конфиг чанкинга и моделей
-# =============================================================================
 
-# --- Time-Session чанкинг ---
 TIME_GAP_SECONDS = 20 * 60       # 20 минут — если разрыв больше, считаем новую сессию
 MAX_MESSAGES_PER_CHUNK = 12      # жёсткий потолок сообщений в чанке (анти-размытие dense)
 MIN_MESSAGES_PER_CHUNK = 1
 OVERLAP_MESSAGES = 2             # сколько сообщений из предыдущей сессии переносим в следующую
 MAX_QUOTE_CONTEXTS = 2           # не более 2-х подмешиваемых цитируемых сессий на чанк
 
-# --- Safety caps по символам (чтобы не сломать эмбеддинги гипер-длиной) ---
-# Qwen3-Embedding-0.6B тянет до 32k токенов, но длинные чанки размывают вектор.
-# 4000 символов ≈ 1300–2000 токенов русского — верхняя граница "здорового" чанка.
 MAX_CHARS_PER_CHUNK_DENSE = 4000
 MIN_CHUNK_LEN = 20
 
-# --- Sparse (BM25 через fastembed, модель в образе) ---
 SPARSE_MODEL_NAME = "Qdrant/bm25"
 FASTEMBED_CACHE_PATH = "/models/fastembed"
 MAX_SPARSE_LEN = 4000
 
-# --- Uvicorn ---
-# 4 CPU / 7 GB RAM. Каждый worker — отдельный процесс: fastembed + pymorphy3
-# dict в памяти × N. 8 workers — перебор и по RAM, и по context-switching.
-# 2 worker-а + asyncio.to_thread дают нормальную утилизацию 4 CPU.
 UVICORN_WORKERS = 2
-
-
-# =============================================================================
-# Лемматизация для BM25
-# =============================================================================
 
 _WORD_RE = re.compile(r"[А-Яа-яЁёA-Za-z0-9]+", re.UNICODE)
 _LATIN_ONLY = re.compile(r"^[A-Za-z]+$")
@@ -142,7 +116,7 @@ def _lemma_ru(word: str) -> str:
 
 
 def lemmatize_text(text: str) -> str:
-    """Токенизация + лемматизация русских слов; латиница/цифры — в lower без изменений.
+    """Токенизация + лемматизация русских слов; латиница/цифры - в lower без изменений.
 
     Задача: сколлапсить падежи, числа, глагольные формы в нормальную форму,
     чтобы BM25 видел 'совещание' / 'совещания' / 'совещанию' как один токен.
@@ -161,10 +135,6 @@ def lemmatize_text(text: str) -> str:
             tokens.append(_lemma_ru(token))
     return " ".join(tokens)
 
-
-# =============================================================================
-# Утилиты для сообщений
-# =============================================================================
 
 def _sender_short(sender_id: str) -> str:
     """ivan.petrov@vk.company -> 'Ivan Petrov'."""
@@ -189,7 +159,7 @@ def _is_useful(message: Message) -> bool:
 
 
 def _extract_parts(message: Message) -> dict[str, list[str]]:
-    """Разбирает parts по media_type → quote / forward / other тексты."""
+    """Разбирает parts по media_type -> quote / forward / other тексты."""
     buckets: dict[str, list[str]] = {"quote": [], "forward": [], "other": []}
     for p in (message.parts or []):
         text = p.get("text")
@@ -204,10 +174,6 @@ def _extract_parts(message: Message) -> dict[str, list[str]]:
             buckets["other"].append(text.strip())
     return buckets
 
-
-# =============================================================================
-# Два рендера: для dense (Qwen) и для sparse (BM25)
-# =============================================================================
 
 def render_for_dense(message: Message) -> str:
     """Натуральный текст для Qwen3-Embedding.
@@ -287,10 +253,6 @@ def render_for_sparse(message: Message) -> str:
     lemmatized = lemmatize_text(joined)
     return lemmatized if lemmatized else joined.lower()
 
-
-# =============================================================================
-# Time-Session чанкинг
-# =============================================================================
 
 def build_sessions(messages: list[Message]) -> list[list[Message]]:
     """Режет отсортированные по времени сообщения на сессии.
@@ -521,10 +483,6 @@ def build_chunks(
 
     return results
 
-
-# =============================================================================
-# Endpoints
-# =============================================================================
 
 @app.get("/health")
 async def health() -> dict[str, str]:
